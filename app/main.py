@@ -9,7 +9,9 @@ from . import services
 from .db import init_db
 from .schemas import (
     FlowCount,
+    FlowEventRow,
     FlowIndexRow,
+    FlowTrace,
     ScanCreate,
     ScanOut,
     ScanUpdate,
@@ -104,3 +106,36 @@ def get_flow_index(
     part_id: str | None = Query(None, description="按工件号过滤"),
 ) -> list[FlowIndexRow]:
     return [FlowIndexRow(**r) for r in services.list_flow_index(part_id)]
+
+
+@app.get("/flow-trace", response_model=FlowTrace,
+         summary="查证某工件某 UTC 日期各方向的首尾两次流转原始扫码")
+def get_flow_trace(
+    part_id: str = Query(..., description="工件号"),
+    day_utc: str = Query(..., description="后一次扫码的 UTC 日期 YYYY-MM-DD"),
+    from_station: str | None = Query(
+        None, description="只看某方向: 前站 (与 to_station 同时提供)"
+    ),
+    to_station: str | None = Query(
+        None, description="只看某方向: 后站 (与 from_station 同时提供)"
+    ),
+) -> FlowTrace:
+    try:
+        return FlowTrace(**services.query_flow_trace(
+            part_id, day_utc, from_station, to_station
+        ))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/flow-events", response_model=list[FlowEventRow],
+         summary="查看查证依据明细 (每条实际流转一行)")
+def get_flow_events(
+    part_id: str | None = Query(None, description="按工件号过滤"),
+    day_utc: str | None = Query(None, description="按 UTC 日期 YYYY-MM-DD 过滤"),
+) -> list[FlowEventRow]:
+    try:
+        return [FlowEventRow(**r)
+                for r in services.list_flow_events(part_id, day_utc)]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

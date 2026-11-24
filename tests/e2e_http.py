@@ -36,11 +36,10 @@ def call(method: str, path: str, body: dict | None = None,
 
 
 def oracle(scans: list[dict]) -> dict[tuple, dict]:
-    """独立于服务实现的全量重算: 返回 (from,to) -> 工件集合/事件数, 按天。"""
+    """独立于服务实现的全量重算: 返回 (part,day,from,to) -> 次数。"""
     by_part: dict[str, list[dict]] = defaultdict(list)
     for s in scans:
         by_part[s["part_id"]].append(s)
-    # (part, day, from, to) -> 次数
     edges: dict[tuple, int] = defaultdict(int)
     for part, items in by_part.items():
         items.sort(key=lambda x: (x["ts_utc"], x["scan_id"]))
@@ -51,6 +50,33 @@ def oracle(scans: list[dict]) -> dict[tuple, dict]:
     return edges
 
 
+def oracle_trace(scans: list[dict], part: str, day: str) -> dict[tuple, dict]:
+    """独立重算首尾: 按 (后一次 ts, 后一次 scan_id) 取每方向首/末。"""
+    items = sorted((s for s in scans if s["part_id"] == part),
+                   key=lambda x: (x["ts_utc"], x["scan_id"]))
+    groups: dict[tuple, list] = defaultdict(list)
+    for a, b in zip(items, items[1:]):
+        if a["station"] == b["station"] or b["day_utc"] != day:
+            continue
+        groups[(a["station"], b["station"])].append((a, b))
+    out = {}
+    for direction, pairs in groups.items():
+        pairs.sort(key=lambda p: (p[1]["ts_utc"], p[1]["scan_id"]))
+        first, last = pairs[0], pairs[-1]
+        out[direction] = {
+            "count": len(pairs),
+            "first": {"prev_scan_id": first[0]["scan_id"],
+                      "prev_ts_utc": first[0]["ts_utc"],
+                      "next_scan_id": first[1]["scan_id"],
+                      "next_ts_utc": first[1]["ts_utc"]},
+            "last": {"prev_scan_id": last[0]["scan_id"],
+                     "prev_ts_utc": last[0]["ts_utc"],
+                     "next_scan_id": last[1]["scan_id"],
+                     "next_ts_utc": last[1]["ts_utc"]},
+        }
+    return out
+
+
 def main() -> int:
     rng = random.Random(20261124)
     print("0. 健康检查/文档")
@@ -58,6 +84,7 @@ def main() -> int:
     with urllib.request.urlopen(BASE + "/openapi.json", timeout=10) as r:
         spec = json.loads(r.read().decode())
     assert "/scans" in spec["paths"] and "/flows" in spec["paths"]
+    assert "/flow-trace" in spec["paths"] and "/flow-events" in spec["paths"]
 
     print("1. 固定场景: 录入 + 日期归属 + 查询")
     call("POST", "/scans", {"scan_id": "e1", "part_id": "E1", "station": "A",
@@ -76,6 +103,18 @@ def main() -> int:
     _, d24 = call("GET", "/flows?start_day=2026-11-24&end_day=2026-11-24")
     assert d23 == [] and len(d24) == 1 and d24[0]["from_station"] == "A" \
         and d24[0]["to_station"] == "B" and d24[0]["part_count"] == 1
+
+    # 跨天: 查 11-24 的首笔来源 e1 时刻在 11-23 (前一次可早于查询日)
+    _, trace = call("GET", "/flow-trace?part_id=E1&day_utc=2026-11-24")
+    assert len(trace["directions"]) == 1
+    d = trace["directions"][0]
+    assert d["count"] == 1
+    assert d["first"]["prev_scan_id"] == "e1"
+    assert d["first"]["prev_ts_utc"] == "2026-11-23T23:50:00.000000Z"
+    assert d["first"]["next_scan_id"] == "e2"
+    assert d["first"] == d["last"]
+    _, no_day = call("GET", "/flow-trace?part_id=E1&day_utc=2026-11-23")
+    assert no_day["directions"] == []
 
     print("2. 改时刻/改工位 + 404/422")
     call("PATCH", "/scans/e2", {"station": "C"})
@@ -130,6 +169,19 @@ def main() -> int:
                    r["to_station"]): r["ref_count"] for r in idx}
         assert actual == dict(expected), (
             f"流向索引不一致\n期望={sorted(expected.items())}\n实际={sorted(actual.items())}")
+        # 查证依据逐方向核对: 次数 + 首尾原始扫码
+        for part in ("R1", "R2", "R3", "R4"):
+            for day in ("2026-11-20", "2026-11-21", "2026-11-22", "2026-11-23",
+                        "2026-11-24"):
+                _, got = call(
+                    "GET", f"/flow-trace?part_id={part}&day_utc={day}")
+                want = oracle_trace(scans, part, day)
+                got_map = {(d["from_station"], d["to_station"]): {
+                    "count": d["count"], "first": d["first"], "last": d["last"],
+                } for d in got["directions"]}
+                assert got_map == want, (
+                    f"查证不一致 part={part} day={day}\n"
+                    f"期望={want}\n实际={got_map}")
         return expected, actual
 
     sync_check()
@@ -188,6 +240,43 @@ def main() -> int:
     total_events = sum(r["ref_count"] for r in idx)
     assert len(idx) <= total_events
     print(f"   流向 {len(flows)} 种, 索引行 {len(idx)} 行 / 事件 {total_events} 次")
+
+    print("6. 演示: 补登后次数不变、首笔来源改变")
+    for body in (
+        {"scan_id": "d1", "part_id": "D1", "station": "A",
+         "ts_utc": "2026-11-24T08:00:00Z"},
+        {"scan_id": "d2", "part_id": "D1", "station": "B",
+         "ts_utc": "2026-11-24T09:00:00Z"},
+        {"scan_id": "d3", "part_id": "D1", "station": "C",
+         "ts_utc": "2026-11-24T10:00:00Z"},
+        {"scan_id": "d4", "part_id": "D1", "station": "A",
+         "ts_utc": "2026-11-24T11:00:00Z"},
+        {"scan_id": "d5", "part_id": "D1", "station": "B",
+         "ts_utc": "2026-11-24T12:00:00Z"},
+    ):
+        call("POST", "/scans", body)
+    _, t0 = call("GET", "/flow-trace?part_id=D1&day_utc=2026-11-24"
+                        "&from_station=A&to_station=B")
+    before = t0["directions"][0]
+    assert before["count"] == 2 and before["first"]["prev_scan_id"] == "d1"
+
+    # 在 d1 之后补登同站 A 的 d0.5: 次数仍 2, 首笔来源变为 d0.5
+    call("POST", "/scans", {"scan_id": "d0.5", "part_id": "D1", "station": "A",
+                            "ts_utc": "2026-11-24T08:30:00Z"})
+    _, t1 = call("GET", "/flow-trace?part_id=D1&day_utc=2026-11-24"
+                        "&from_station=A&to_station=B")
+    after = t1["directions"][0]
+    assert after["count"] == before["count"] == 2, "次数应保持不变"
+    assert after["first"]["prev_scan_id"] == "d0.5", after["first"]
+    assert after["first"]["prev_ts_utc"] == "2026-11-24T08:30:00.000000Z"
+    assert after["first"]["next_scan_id"] == "d2"
+    _, flows_d1 = call("GET", "/flows?start_day=2026-11-24&end_day=2026-11-24")
+    ab = [f for f in flows_d1 if f["from_station"] == "A"
+          and f["to_station"] == "B"][0]
+    assert ab["event_count"] >= 2
+    print(f"   次数 {before['count']} -> {after['count']} (不变), "
+          f"首笔来源 {before['first']['prev_scan_id']} -> "
+          f"{after['first']['prev_scan_id']}")
 
     print("全部端到端检查通过 ✔")
     return 0

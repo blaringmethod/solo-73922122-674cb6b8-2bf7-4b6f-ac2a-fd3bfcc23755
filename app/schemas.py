@@ -52,3 +52,35 @@ class FlowIndexRow(BaseModel):
     from_station: str
     to_station: str
     ref_count: int
+
+
+class FlowEventRow(BaseModel):
+    next_scan_id: str = Field(..., description="后一次扫码编号")
+    part_id: str
+    day_utc: str = Field(..., description="归入的 UTC 日期 (后一次扫码)")
+    from_station: str
+    to_station: str
+    prev_scan_id: str = Field(..., description="前一次扫码编号")
+    prev_ts_utc: str
+    next_ts_utc: str
+
+
+class TraceEndpoint(BaseModel):
+    prev_scan_id: str = Field(..., description="前一次 (来源) 扫码编号")
+    prev_ts_utc: str = Field(..., description="前一次扫码 UTC 时刻 (可早于查询日)")
+    next_scan_id: str = Field(..., description="后一次 (目的) 扫码编号")
+    next_ts_utc: str
+
+
+class FlowDirectionTrace(BaseModel):
+    from_station: str
+    to_station: str
+    count: int = Field(..., description="该件该 UTC 日期该方向的实际流转次数")
+    first: TraceEndpoint = Field(..., description="按 (后一次时刻, 编号) 的首笔流转")
+    last: TraceEndpoint = Field(..., description="按 (后一次时刻, 编号) 的末笔流转")
+
+
+class FlowTrace(BaseModel):
+    part_id: str
+    day_utc: str
+    directions: list[FlowDirectionTrace]
